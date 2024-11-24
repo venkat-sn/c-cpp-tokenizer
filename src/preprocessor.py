@@ -1,20 +1,22 @@
 import os
 import re
-from datetime import datetime
-from pathlib import Path
-import tiktoken
-import traceback
-from concurrent.futures import ProcessPoolExecutor
 import json
 import logging
-from dataclasses import dataclass, asdict
-import hashlib
-from typing import List, Optional, Set, Any, Dict, Tuple
-import pandas as pd
-from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
 import time
-from src.utils.file_utils import FileScanner, detect_language
+import hashlib
+import tiktoken
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import fnmatch as fnmatch
+import traceback
+
+import pandas as pd
 from config.default_config import get_default_config, update_config
+from src.utils.file_utils import FileScanner, detect_language
 
 @dataclass
 class CodeSnippet:
@@ -82,24 +84,194 @@ def read_file_with_encoding(file_path: Path) -> Tuple[str, str]:
     # If we get here, none of the encodings worked
     raise ValueError(f"Failed to read with any encoding. Errors:\n" + "\n".join(errors))
 
+@dataclass
+class ScanPattern:
+    """Represents a file/directory scanning pattern"""
+    pattern: str
+    is_file: bool = False
+    is_dir: bool = False
+    is_wildcard: bool = False
+    
+    @classmethod
+    def from_path(cls, path: str) -> 'ScanPattern':
+        """Create a ScanPattern from a path string"""
+        path = path.strip()
+        
+        # Check if it's a wildcard pattern
+        if any(char in path for char in '*?[]'):
+            return cls(path, is_wildcard=True)
+            
+        path_obj = Path(path)
+        if path_obj.exists():
+            return cls(path, is_file=path_obj.is_file(), is_dir=path_obj.is_dir())
+        else:
+            # Assume it's a wildcard if it doesn't exist
+            return cls(path, is_wildcard=True)
+
+class EnhancedFileScanner:
+    """Enhanced file scanner supporting explicit include/exclude patterns"""
+    
+    def __init__(
+        self,
+        include_patterns: List[str],
+        exclude_patterns: Optional[List[str]] = None,
+        allowed_extensions: Optional[Set[str]] = None,
+        config: Optional[Dict[str, Any]] = None,
+        use_default_includes: bool = True,
+        use_default_excludes: bool = True
+    ):
+        self.config = config or get_default_config()
+        
+        # Get effective patterns by merging CLI patterns with defaults if requested
+        self.include_patterns = [
+            ScanPattern.from_path(p) for p in self._merge_include_patterns(
+                include_patterns, 
+                use_defaults=use_default_includes
+            )
+        ]
+        
+        self.exclude_patterns = [
+            ScanPattern.from_path(p) for p in self._merge_exclude_patterns(
+                exclude_patterns,
+                use_defaults=use_default_excludes
+            )
+        ]
+        
+        # Get allowed extensions
+        self.allowed_extensions = allowed_extensions or set()
+        
+        # Log the final scanning configuration
+        logging.info("\nScanner Configuration:")
+        logging.info("Include patterns:")
+        for pattern in self.include_patterns:
+            logging.info(f"  {pattern.pattern}")
+        logging.info("\nExclude patterns:")
+        for pattern in self.exclude_patterns:
+            logging.info(f"  {pattern.pattern}")
+
+    def _merge_include_patterns(self, cli_patterns: List[str], use_defaults: bool) -> List[str]:
+        """Get final include patterns after merging with defaults"""
+        patterns = set(cli_patterns)
+        
+        if use_defaults:
+            # Add patterns for file extensions from config
+            for ext in self.config['file_settings']['default_extensions']:
+                patterns.add(f"**/*{ext}")
+            
+            # Add patterns for specific filenames
+            for filename in self.config['file_settings']['include_filenames']:
+                patterns.add(f"**/{filename}")
+                
+            logging.debug("Using default include patterns")
+            
+        return list(patterns)
+
+    def _merge_exclude_patterns(self, cli_patterns: Optional[List[str]], use_defaults: bool) -> List[str]:
+        """Get final exclude patterns after merging with defaults"""
+        patterns = set(cli_patterns or [])
+        
+        if use_defaults:
+            # Add exclude patterns from config's exclude_dirs
+            for exclude_dir in self.config['file_settings']['exclude_dirs']:
+                patterns.add(f"**/{exclude_dir}/**")
+                
+            logging.debug("Using default exclude patterns")
+            
+        return list(patterns)
+
+    def should_include_path(self, path: Path) -> bool:
+        """Determine if a path should be included"""
+        path_str = str(path)
+        
+        # First check exclusions
+        for pattern in self.exclude_patterns:
+            if pattern.is_wildcard:
+                if fnmatch.fnmatch(path_str, pattern.pattern):
+                    return False
+            elif pattern.is_file and path_str == pattern.pattern:
+                return False
+            elif pattern.is_dir and path_str.startswith(pattern.pattern):
+                return False
+        
+        # Then check inclusions
+        for pattern in self.include_patterns:
+            if pattern.is_wildcard:
+                if fnmatch.fnmatch(path_str, pattern.pattern):
+                    return self._check_extension(path)
+            elif pattern.is_file and path_str == pattern.pattern:
+                return self._check_extension(path)
+            elif pattern.is_dir and path_str.startswith(pattern.pattern):
+                return self._check_extension(path)
+                
+        return False
+
+    def _check_extension(self, path: Path) -> bool:
+        """Check if file has allowed extension"""
+        if not self.allowed_extensions:
+            return True
+        return path.suffix.lower() in self.allowed_extensions
+
+    def scan_files(self) -> List[Path]:
+        """Scan for files based on patterns"""
+        included_files = set()
+        
+        # Process each include pattern
+        for pattern in self.include_patterns:
+            if pattern.is_file:
+                path = Path(pattern.pattern)
+                if path.exists() and path.is_file() and self.should_include_path(path):
+                    included_files.add(path)
+            else:
+                # For directories and wildcards, walk the tree
+                base_dir = Path(pattern.pattern).parent
+                if str(base_dir) == '.':
+                    base_dir = Path.cwd()
+                    
+                for dirpath, _, filenames in os.walk(str(base_dir)):
+                    dir_path = Path(dirpath)
+                    for filename in filenames:
+                        file_path = dir_path / filename
+                        if self.should_include_path(file_path):
+                            included_files.add(file_path)
+        
+        files_list = sorted(list(included_files))
+        logging.info(f"\nFound {len(files_list)} matching files")
+        return files_list
+
 class CodePreprocessor:
-    def __init__(self,
-                 input_dir: str,
-                 output_dir: str,
-                 additional_extensions: Set[str] = None,
-                 exclude_dirs: Set[str] = None,
-                 max_tokens: int = None,
-                 min_tokens: int = None,
-                 tokenizer: str = None,
-                 n_workers: int = None,
-                 appconfig: Dict[str, Any] = None):
+    def __init__(
+        self,
+        include_patterns: List[str],
+        output_dir: str,
+        exclude_patterns: Optional[List[str]] = None,
+        additional_extensions: Optional[Set[str]] = None,
+        exclude_dirs: Optional[Set[str]] = None,
+        max_tokens: Optional[int] = None,
+        min_tokens: Optional[int] = None,
+        tokenizer: Optional[str] = None,
+        n_workers: Optional[int] = None,
+        appconfig: Optional[Dict[str, Any]] = None,
+        use_default_includes: bool = True,
+        use_default_excludes: bool = True
+    ):
         """
         Initialize the code preprocessor
+        
+        Args:
+            include_patterns: List of files/directories/patterns to include
+            output_dir: Directory where processed files will be saved
+            exclude_patterns: List of files/directories/patterns to exclude
+            additional_extensions: Additional file extensions to process
+            exclude_dirs: Additional directories to exclude (maintained for backwards compatibility)
+            max_tokens: Maximum tokens per example
+            min_tokens: Minimum tokens per example
+            tokenizer: Name of the tokenizer to use
+            n_workers: Number of worker processes
+            appconfig: Application configuration dictionary
         """
         self.config = appconfig or get_default_config()
         
         # Setup paths
-        self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         
         # Set number of workers
@@ -107,8 +279,9 @@ class CodePreprocessor:
         
         # Log initialization parameters
         logging.debug(f"Initializing CodePreprocessor with parameters:")
-        logging.debug(f"  Input directory: {self.input_dir}")
         logging.debug(f"  Output directory: {self.output_dir}")
+        logging.debug(f"  Include patterns: {include_patterns}")
+        logging.debug(f"  Exclude patterns: {exclude_patterns}")
         logging.debug(f"  Additional extensions: {additional_extensions}")
         logging.debug(f"  Exclude dirs: {exclude_dirs}")
         logging.debug(f"  Number of workers: {self.n_workers}")
@@ -123,18 +296,24 @@ class CodePreprocessor:
         if tokenizer:
             self.config['token_settings']['tokenizer'] = tokenizer
         
-        # Update file extensions and excluded dirs
+        # Update file extensions and excluded dirs in config
         if additional_extensions:
             self.config['file_settings']['default_extensions'].update(additional_extensions)
+            
+        # Convert exclude_dirs to exclude_patterns if provided (for backwards compatibility)
         if exclude_dirs:
-            self.config['file_settings']['exclude_dirs'].update(exclude_dirs)
-        
-        # Create file scanner with updated settings
-        self.file_scanner = FileScanner(
-            self.input_dir,
-            self.config['file_settings']['default_extensions'],
-            self.config['file_settings']['exclude_dirs'],
-            self.config['file_settings']['include_filenames']
+            exclude_patterns = (exclude_patterns or []) + [
+                f"**/{d}/**" for d in exclude_dirs  # Convert to glob pattern
+            ]
+            
+        # Create enhanced file scanner
+        self.file_scanner = EnhancedFileScanner(
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            allowed_extensions=self.config['file_settings']['default_extensions'],
+            config=self.config,
+            use_default_includes=use_default_includes,
+            use_default_excludes=use_default_excludes
         )
         
         # Setup tokenizer
@@ -220,7 +399,7 @@ class CodePreprocessor:
             
             return CodeSnippet(
                 content=content,
-                file_path=str(file_path.relative_to(self.input_dir)),
+                file_path=str(file_path),  # Changed from relative_to(self.input_dir)
                 language=language,
                 n_tokens=n_tokens,
                 hash=content_hash,
